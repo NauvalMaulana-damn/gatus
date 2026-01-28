@@ -1,0 +1,138 @@
+name: Deploy LKS Project Management Stack
+on:
+push:
+branches:
+- "main"
+paths:
+- "leantime/**"
+- "gatus/**"
+- ".github/workflows/lks-deployment-pipeline.yml"
+env:
+AWS_REGION: us-east-1
+ECR_REPOSITORY: lks-gatus
+ECS_CLUSTER: lks-oss-cluster
+# Leantime Settings
+LEANTIME_SERVICE: leantime-service
+LEANTIME_TASK_DEF: leantime/task-definition.json
+LEANTIME_CONTAINER_NAME: leantime # Pastikan ini sesuai dengan nama container di JSON
+# Gatus Settings
+GATUS_SERVICE: gatus-service
+GATUS_TASK_DEF: gatus/task-definition.json
+GATUS_CONTAINER_NAME: gatus # Pastikan ini sesuai dengan nama container di JSON
+jobs:
+# ------------------------------------------------------------------
+# JOB 1: DEPLOY LEANTIME APP
+# Render task definition baru dan deploy ke ECS
+# ------------------------------------------------------------------
+deploy-leantime:
+runs-on: ubuntu-latest
+steps:
+- name: Checkout Code
+uses: actions/checkout@v4
+- name: Configure AWS Credentials
+uses: aws-actions/configure-aws-credentials@v4
+with:
+aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+aws-region: ${{ env.AWS_REGION }}
+- name: Fill in the new image ID in the Amazon ECS task definition
+id: task-def-leantime
+uses: aws-actions/amazon-ecs-render-task-definition@v1
+with:
+task-definition: ${{ env.LEANTIME_TASK_DEF }}
+container-name: ${{ env.LEANTIME_CONTAINER_NAME }}
+# Asumsi: Leantime menggunakan image official/tetap.
+# Jika image berubah, masukkan image: tag di sini.
+# Jika hanya update konfigurasi env var/mounts, langkah ini merender file JSON.
+image: leantime/leantime:latest
+- name: Deploy Leantime to Amazon ECS
+uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+with:
+task-definition: ${{ steps.task-def-leantime.outputs.task-definition }}
+service: ${{ env.LEANTIME_SERVICE }}
+cluster: ${{ env.ECS_CLUSTER }}
+wait-for-service-stability: true
+# ------------------------------------------------------------------
+# JOB 2: BUILD & PUSH GATUS
+# Konfigurasi config.yaml, Build Docker Image, Push ke ECR
+# ------------------------------------------------------------------
+build-gatus:
+runs-on: ubuntu-latest
+outputs:
+image: ${{ steps.build-image.outputs.image }}
+steps:
+- name: Checkout Code
+uses: actions/checkout@v4
+- name: Configure AWS Credentials
+uses: aws-actions/configure-aws-credentials@v4
+with:
+aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+aws-region: ${{ env.AWS_REGION }}
+- name: Login to Amazon ECR
+id: login-ecr
+uses: aws-actions/amazon-ecr-login@v2
+# LANGKAH KRUSIAL: Inject Secrets ke config.yaml sebelum build
+# Menggunakan envsubst untuk mengganti placeholder di config.yaml dengan value asli
+- name: Inject Configuration Secrets
+env:
+TOKEN: ${{ secrets.TOKEN }}
+ALB_ENDPOINT: ${{ secrets.ALB_ENDPOINT }}
+run: |
+# Pastikan file config.yaml Anda menggunakan format ${TOKEN} dan ${ALB_ENDPOINT}
+# Contoh command ini akan me-replace variabel env ke dalam file
+cd gatus/config
+envsubst < config.yaml > config.tmp && mv config.tmp config.yaml
+echo "Gatus configuration injected."
+- name: Build, tag, and push image to Amazon ECR
+id: build-image
+env:
+ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+IMAGE_TAG: ${{ github.sha }}
+run: |
+cd gatus
+docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+# ------------------------------------------------------------------
+# JOB 3: DEPLOY GATUS APP
+# Deploy image baru yang sudah dibuild ke ECS
+# ------------------------------------------------------------------
+deploy-gatus:
+needs: build-gatus
+runs-on: ubuntu-latest
+steps:
+- name: Checkout Code
+uses: actions/checkout@v4
+- name: Configure AWS Credentials
+uses: aws-actions/configure-aws-credentials@v4
+with:
+aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+aws-region: ${{ env.AWS_REGION }}
+- name: Fill in the new image ID in the Amazon ECS task definition
+id: task-def-gatus
+uses: aws-actions/amazon-ecs-render-task-definition@v1
+with:
+task-definition: ${{ env.GATUS_TASK_DEF }}
+container-name: ${{ env.GATUS_CONTAINER_NAME }}
+image: ${{ needs.build-gatus.outputs.image }}
+- name: Deploy Gatus to Amazon ECS
+uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+with:
+task-definition: ${{ steps.task-def-gatus.outputs.task-definition }}
+service: ${{ env.GATUS_SERVICE }}
+cluster: ${{ env.ECS_CLUSTER }}
+wait-for-service-stability: true
+# Contoh snippet gatus/config/config.yaml
+alerting:
+github:
+token: "${TOKEN}" # Ini akan diganti oleh GitHub Actions
+endpoints:
+- name: leantime
+url: "http://${ALB_ENDPOINT}" # Ini akan diganti oleh GitHub Actions
